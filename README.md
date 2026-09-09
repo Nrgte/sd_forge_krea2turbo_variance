@@ -8,22 +8,17 @@ variety levers are:
    noise on a copy of the positive Qwen3-VL conditioning for the first N
    steps (where identity/composition forms), then the clean conditioning so
    later steps still refine. No input image needed, works with every sampler.
-2. **Latent dials** — the sampler selected in the tab's Sampler dropdown adds
-   noise to the *latent* instead (often washed out at CFG 1.0, weaker for
-   faces, but still useful and additive to cond noise).
+2. **Latent dials (RAW only, untested)** — the sampler selected in the tab's
+   Sampler dropdown adds noise to the *latent* instead (often washed out at
+   CFG 1.0, weaker for faces, but still useful and additive to cond noise).
+   Documented in the last section, since cond noise is the main lever.
 
 The extension lives in a "Krea2 Variance" accordion in the main txt2img and
 img2img layout. Tick the checkbox to enable, untick to disable. **Cond noise
 is shown at the top** (the turbo-relevant lever). The **latent dials are
-tucked into a "RAW only (untested)" sub-accordion** — they only act for the
-three samplers below and are usually washed out at CFG 1.0:
-
-| Tab sampler | Latent dial (in the RAW-only sub-menu) |
-|---|---|
-| **Euler a** | **Eta** — per-step ancestral re-noise for this generation (otherwise only the global `eta_ancestral` setting exists; there is no per-tab eta control) |
-| **ER SDE** | **Noise (ER SDE)** — the solver's `s_noise`, which is otherwise fixed at 1.0 and not configurable from the UI at all |
-| **Euler** | **Noise (Euler)** + **Start/End step** — keeps the deterministic Euler walk and adds seeded per-step jitter on the steps you choose (the one thing no built-in sampler offers) |
-| anything else | no effect (latent); cond noise still applies |
+tucked into a "RAW only (untested)" sub-accordion** at the bottom of the
+accordion — they only act for the three samplers listed in the last section
+and are usually washed out at CFG 1.0.
 
 All injected noise is **seeded from your seed** (latent noise via the WebUI's
 seeded RNG, the same mechanism the built-in ancestral samplers use; cond
@@ -53,7 +48,25 @@ sampler runs untouched.
 - With **batch > 1** the whole batch shares one perturbation (same face
   within the batch) — use batch 1 and vary the seed for variety.
 
-## Latent dials (secondary, additive — in the RAW-only sub-menu)
+## If the face still doesn't change
+
+1. Check the logged L2 — if it's < ~1%, raise Cond noise.
+2. Make sure the prompt doesn't over-constrain identity (e.g. a named
+   character or very specific descriptor can re-converge the face).
+3. The remaining levers are the **Krea 2 Raw** model, identity-descriptive
+   prompt terms, or a face-diversity LoRA.
+
+## Latent dials (RAW only, untested — secondary, additive)
+
+The tab sampler chooses which dial applies; all of them live in the
+"RAW only (untested)" sub-accordion:
+
+| Tab sampler | Latent dial |
+|---|---|
+| **Euler a** | **Eta** — per-step ancestral re-noise for this generation (otherwise only the global `eta_ancestral` setting exists; there is no per-tab eta control) |
+| **ER SDE** | **Noise (ER SDE)** — the solver's `s_noise`, which is otherwise fixed at 1.0 and not configurable from the UI at all |
+| **Euler** | **Noise (Euler)** + **Start/End step** — keeps the deterministic Euler walk and adds seeded per-step jitter on the steps you choose (the one thing no built-in sampler offers) |
+| anything else | no effect (latent); cond noise still applies |
 
 The starting points below are ordered roughly strongest → weakest face
 change:
@@ -67,11 +80,3 @@ change:
   `eta_ancestral` setting.)
 
 Cond noise can be combined with any of these (they perturb different things).
-
-## If the face still doesn't change
-
-1. Check the logged L2 — if it's < ~1%, raise Cond noise.
-2. Make sure the prompt doesn't over-constrain identity (e.g. a named
-   character or very specific descriptor can re-converge the face).
-3. The remaining levers are the **Krea 2 Raw** model, identity-descriptive
-   prompt terms, or a face-diversity LoRA.
