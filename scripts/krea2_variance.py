@@ -19,12 +19,16 @@ different images) and both without any input image:
    latent noise is often washed out — the face barely changes across seeds.
 
 2. Cond noise (any sampler) — seeded gaussian noise on a COPY of the positive
-   Qwen3-VL conditioning for the first N steps (where identity/composition
-   forms), then the clean conditioning so later steps still refine. This is
-   the main face-variety lever for Krea2 turbo. The copy is deep-copied
-   recursively (list/dict/tuple/namedtuple/object), never mutated in place:
-   the Qwen3-VL engine caches embeddings per prompt line and the same tensor
-   objects are shared across schedule entries and generations.
+    Qwen3-VL conditioning for the first N steps (Cond noise steps), where
+    identity/composition form; later steps run on the clean conditioning so
+    the image still refines. The **Cond noise** dial is the baseline strength
+    for those steps; the **Step 1 boost** adds extra strength on top of the
+    baseline for the first (identity-forming) step only. This is the main
+    face-variety lever for Krea2 turbo. The copy is deep-copied recursively
+    (list/dict/tuple/namedtuple/object), never mutated in place: the Qwen3-VL
+    engine caches embeddings per prompt line and the same tensor objects are
+    shared across schedule entries and generations. Baseline and boost use
+    the same seed, hence the same random draw — only the scale differs.
 
 All latent noise is drawn through k_diffusion.sampling.torch, which
 Sampler.initialize() reassigns to TorchHijack(p) — i.e. from p.rng, the
@@ -54,7 +58,7 @@ from modules.ui_components import InputAccordion
 # The noise machinery lives in the extension-root lib_krea2/ package (the
 # extension dir is on sys.path while this script loads — same pattern as
 # sd_forge_spectrum importing lib_spectrum).
-from lib_krea2.cond_noise import _CondNoiseModel, _kv_seed, _noised_conditioning
+from lib_krea2.cond_noise import _CondNoiseModel, _kv_seeds, _noised_conditioning
 from lib_krea2.euler_variance import sample_euler_variance
 
 SAMPLER_ANCESTRAL = "Euler a"   # funcname sample_euler_ancestral
@@ -64,18 +68,18 @@ SAMPLER_EULER = "Euler"         # funcname sample_euler
 _warned = {}
 
 info = """
-<b>Cond noise</b> &mdash; the face-variety lever for Krea2 <i>turbo</i> (CFG 1.0).
-Seeded gaussian noise on a copy of the positive Qwen3-VL conditioning for the
-first N steps, then the clean conditioning so later steps still refine. No input
-image is needed; all noise is seeded: same seed &rarr; pixel-identical image,
-different seeds &rarr; genuinely different images.
+<b>Cond noise</b> &mdash; per-seed face variety for Krea2 turbo, no input
+image. All noise is seeded: same seed &rarr; pixel-identical image,
+different seeds &rarr; genuinely different images; with batch &gt; 1 each
+image gets its own seed automatically. What each dial does: the tooltips
+next to its label.
 <ul>
-<li><b>Cond noise</b> (any sampler) &rarr; <b>Cond noise + steps</b>: 0 = off; default 1.2 noise / 1 step (perturbs only the identity-forming step); 2&ndash;3 strong. With batch &gt; 1 the batch shares one perturbation &mdash; vary the seed for variety.</li>
-<li>If the face barely moves: raise <b>Cond noise</b> (the console logs the measured L2 perturbation &mdash; below ~1% it won't register). If it degrades the image: lower the strength or shorten the steps.</li>
+<li>If the face barely moves: raise <b>Step 1 boost</b> first, then <b>Cond noise</b> / steps.</li>
+<li>If it degrades the image: lower <b>Cond noise</b> first, then the boost.</li>
 </ul>
-The <b>RAW only (untested)</b> sub-menu below holds the <i>latent</i>-noise dials.
-At CFG 1.0 the positive conditioning dominates the trajectory, so those are
-usually washed out &mdash; Cond noise is the reliable lever.
+The console logs one line per generation (field meanings in the README).
+The <b>RAW only (untested)</b> sub-menu below holds the latent-noise dials,
+which are usually washed out &mdash; Cond noise is the reliable lever.
 """
 
 info_raw = """
@@ -99,26 +103,47 @@ def _warn(key, msg):
 
 
 def _kv_cond_prepare(self, p, conditioning):
-    """Build the step-aware conditioning wrapper for this generation, or None.
+    """Build the call-aware conditioning wrapper for this generation, or None.
 
     Sampler-independent: at CFG 1.0 the positive conditioning dominates, so
-    the perturbation works the same for every k-diffusion sampler.
+    the perturbation works the same for every k-diffusion sampler. Each
+    image's conditioning row is noised with THAT image's own seed (from
+    p.seeds), so a batch of N gets N independent perturbations instead of
+    one shared draw. The first model call (identity-forming step) gets
+    strength base + boost, calls 1..steps-1 get the base strength, calls
+    from `steps` onward get the clean conditioning. Both noised passes are
+    seeded with the same per-image seeds, so each image uses the same
+    random draw (only the scale differs); a zero base leaves the clean
+    conditioning in place for the later window calls.
     """
     if not getattr(p, "kv_cond_active", False) or conditioning is None:
         return None
 
-    seed = _kv_seed(p)
-    noised, stats = _noised_conditioning(conditioning, seed, p.kv_cond_noise)
+    seeds = _kv_seeds(p)
+    seed = seeds[0]
+    base = float(p.kv_cond_noise)
+    boost = float(p.kv_cond_boost)
+    steps = max(1, int(p.kv_cond_steps))
+    if base > 0:
+        rest, rest_stats = _noised_conditioning(conditioning, seeds, base)
+    else:
+        rest, rest_stats = conditioning, None
+    if boost > 0:
+        first, first_stats = _noised_conditioning(conditioning, seeds, base + boost)
+    else:
+        first, first_stats = rest, rest_stats
 
+    stats = first_stats if first_stats is not None else rest_stats
     if stats.values == 0:
         _warn("cond_none", "cond noise enabled but no float tensors found in the positive conditioning — nothing to perturb (check that the active model uses an embedding the recursive noiser can reach).")
         return None
 
-    print(f"[Krea2Variance] cond noise: seed={seed} strength={p.kv_cond_noise} steps={int(p.kv_cond_steps)} embed_std={stats.std:.4g} L2={stats.rel_l2 * 100:.2f}% values={stats.values}", flush=True)
+    base_l2 = rest_stats.rel_l2 if rest_stats is not None else 0.0
+    print(f"[Krea2Variance] cond noise: seed={seed} base={base} boost={boost} steps={steps} step1={base + boost} embed_std={stats.std:.4g} values={stats.values} L2_base={base_l2 * 100:.1f}% L2_step1={stats.rel_l2 * 100:.1f}%", flush=True)
     if stats.rel_l2 < 0.01:
-        _warn("cond_weak", f"cond noise L2 perturbation {stats.rel_l2 * 100:.2f}% < 1% — likely too weak to register; raise Cond noise.")
+        _warn("cond_weak", f"cond noise L2 perturbation {stats.rel_l2 * 100:.2f}% < 1% — likely too weak to register; raise Cond noise / Step 1 boost.")
 
-    return _CondNoiseModel(self.model_wrap_cfg, noised, conditioning, p.kv_cond_steps)
+    return _CondNoiseModel(self.model_wrap_cfg, first, rest, conditioning, steps)
 
 
 def _kv_prepare(self, p):
@@ -230,7 +255,7 @@ class Krea2Variance(scripts.Script):
                     value=1.2,
                     step=0.05,
                     label="Cond noise (any sampler)",
-                    info="seeded gaussian noise on the positive Qwen3-VL conditioning — the main face-variety lever at CFG 1.0, where latent noise gets washed out. 0 = off; default 1.2; 2-3 strong. Works with every sampler.",
+                    info="how much seeded noise to add to the text prompt — this is what changes the face. 0 = off. Works with every sampler.",
                 )
                 cond_steps = gr.Slider(
                     minimum=1,
@@ -238,7 +263,15 @@ class Krea2Variance(scripts.Script):
                     value=1,
                     step=1,
                     label="Cond noise steps (any sampler)",
-                    info="how many initial steps run on the perturbed conditioning (identity/composition form there); later steps use the clean conditioning so the image still refines. Krea2 turbo runs 8 steps; default 1 perturbs only the identity-forming step.",
+                    info="how many of the first steps the noise runs on. More steps = stronger effect, but more risk of degrading the image. Krea2 turbo runs 8 steps.",
+                )
+                boost = gr.Slider(
+                    minimum=0.0,
+                    maximum=3.0,
+                    value=0.0,
+                    step=0.05,
+                    label="Step 1 boost (any sampler)",
+                    info="extra noise for the very first step only, where the face forms — the most effective dial. 0 = off.",
                 )
             with gr.Accordion(label="RAW only (untested)", open=False):
                 gr.HTML(info_raw)
@@ -293,10 +326,11 @@ class Krea2Variance(scripts.Script):
             (end, "KV End"),
             (cond_noise, "KV Cond Noise"),
             (cond_steps, "KV Cond Noise Steps"),
+            (boost, "KV Step 1 Boost"),
         ]
-        return [enabled, eta, noise_er, noise_euler, start, end, cond_noise, cond_steps]
+        return [enabled, eta, noise_er, noise_euler, start, end, cond_noise, cond_steps, boost]
 
-    def process(self, p, enabled, eta, noise_er, noise_euler, start, end, cond_noise, cond_steps):
+    def process(self, p, enabled, eta, noise_er, noise_euler, start, end, cond_noise, cond_steps, boost):
         # always-visible: the accordion checkbox is the on/off switch; only
         # configure p here, the normal pipeline runs regardless
         p.kv_active = False
@@ -308,18 +342,21 @@ class Krea2Variance(scripts.Script):
         p.kv_cond_active = False
         p.kv_cond_noise = 1.2
         p.kv_cond_steps = 1
+        p.kv_cond_boost = 0.0
 
         if not (enabled and getattr(dynamic_args, "krea2", False)):
             return
 
         # cond noise: sampler-independent, additive to the latent dials
-        cond_on = float(cond_noise) > 0
+        cond_on = float(cond_noise) > 0 or float(boost) > 0
         if cond_on:
             p.kv_cond_active = True
             p.kv_cond_noise = float(cond_noise)
             p.kv_cond_steps = max(1, int(cond_steps))
+            p.kv_cond_boost = float(boost)
             p.extra_generation_params["KV Cond Noise"] = p.kv_cond_noise
             p.extra_generation_params["KV Cond Noise Steps"] = p.kv_cond_steps
+            p.extra_generation_params["KV Step 1 Boost"] = p.kv_cond_boost
 
         sampler = p.sampler_name or ""
         if sampler == SAMPLER_ANCESTRAL:
